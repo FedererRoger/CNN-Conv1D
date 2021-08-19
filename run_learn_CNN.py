@@ -3,19 +3,26 @@ from sklearn.model_selection import train_test_split
 #from sklearn.externals import joblib
 import joblib
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 import subprocess
 import os
 from scipy.linalg import lstsq
 from scipy import stats
+import glob
+from torch import nn
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+global accuracy_mas, loss_mas
+global features, targets
 
 # total count of wells
 TOTAL_COUNT = 900
 
 # path to wells
-#DATASET_PATH = '../Datasets/SynthBase2020/train/'
+DATASET_PATH = '../Datasets/SynthBase2020/train/'
 #DATASET_PATH = '../Datasets/SynthBase2020/validation/'
-DATASET_PATH = '../Datasets/SynthBase2020/field/'
+#DATASET_PATH = '../Datasets/SynthBase2020/field/'
 
 # split wells to train and test
 
@@ -95,8 +102,6 @@ def createFeatures(id):
 
 	# make targets and features
 	win2_size = 8
-	targets = []
-	features = []
 	for i in range(0, N):
 		# targets
 		inflow_data = getDataFromWindow(inflows, i, win2_size, TILE_SIZE)
@@ -108,9 +113,141 @@ def createFeatures(id):
 		# features
 		delta_f = normFeature(getDataFromWindowStep(delta, i, win2_size * N_hyper, N_hyper, TILE_SIZE))
 		T_f = normFeature(getDataFromWindowStep(T_m, i, win2_size * N_hyper, N_hyper, TILE_SIZE))
-		f = np.concatenate((delta_f, T_f), axis=0)
-		# f = delta_f
-		features.append(f)
-
+		features.append([delta_f]+[T_f])
 	# return targets, features
-	return targets, features, data[0], data[1], data[3]
+	return 1
+
+features = []
+targets = []
+
+for i in range(200):
+	createFeatures(i)
+#features_delta = np.array([np.array(xi) for xi in features_delta])
+#features_delta = features_delta.astype("float")
+#features_Tf = np.array([np.array(xi) for xi in features_Tf])
+#features_Tf = features_Tf.astype("float")
+
+DataX = np.array([np.array(xi) for xi in features])
+DataX = DataX.astype("float")
+DataY = np.array([np.array(xi) for xi in targets])
+DataY = DataY.astype("float")
+
+DataX = torch.Tensor(DataX)
+DataY = torch.Tensor(DataY)
+
+print(DataY)
+
+print(len(DataX))
+
+#Определяем пользовательский датасет
+class CustomDataset(Dataset):
+
+    def __init__(self, X, Y):
+        self.X = X
+        self.Y = Y
+
+    def __len__(self):
+        return len(self.Y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
+TT_SPLIT = (3 * len(DataY)) // 4
+print(TT_SPLIT)
+train_data = CustomDataset(DataX[:TT_SPLIT,...], DataY[:TT_SPLIT])
+test_data = CustomDataset(DataX[TT_SPLIT:,...], DataY[TT_SPLIT:])
+batch_size = 100
+learning_rate = 0.003
+train_loader = DataLoader(dataset=train_data, batch_size=batch_size,shuffle=True)
+test_loader = DataLoader(dataset=test_data, batch_size=batch_size,shuffle=True)
+
+#Конструируем нейросеть
+class ConvNet(nn.Module):
+    def __init__(self):
+        super(ConvNet, self).__init__()
+        self.layer1 = nn.Sequential(
+            nn.Conv1d(2, 4, 3),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2),
+            nn.Conv1d(4, 8, 3),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=2),
+        )
+        self.flatten = nn.Flatten()
+        self.linear_relu_stack = nn.Sequential(
+            nn.Linear(16, 4),
+            nn.ReLU(),
+            nn.Linear(4, 1)
+        )
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.flatten(x)
+        x = self.linear_relu_stack(x)
+        return torch.sigmoid(x)
+
+#Обучаем модель
+model = ConvNet()
+criterion = nn.BCELoss()
+#criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+def train_loop(dataloader, model, loss_fn, optimizer):
+    size = len(dataloader.dataset)
+    for batch, (X, y) in enumerate(dataloader):
+        # Compute prediction and loss
+        pred = model(X)
+        loss = loss_fn(pred, y)
+
+        # Backpropagation
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if batch % 10 == 0:
+            loss, current = loss.item(), batch * len(X)
+            print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+
+
+def test_loop(dataloader, model, loss_fn):
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)
+    test_loss, correct_count = 0, 0
+
+    with torch.no_grad():
+        for X, y in dataloader:
+            pred = model(X)
+            test_loss += loss_fn(pred, y).item()
+            correct_count += pred.eq(y.data.view_as(pred)).sum()
+
+    test_loss /= num_batches
+    correct = correct_count / size
+    accuracy_mas.append(correct*100)
+    loss_mas.append([test_loss])
+    print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} Correct: {correct_count} \n")
+
+
+
+epochs = 50
+
+epochs_mas = np.arange(1, epochs+1)
+accuracy_mas = []
+loss_mas = []
+
+for t in range(epochs):
+    print(f"Epoch {t+1}\n-------------------------------")
+    train_loop(train_loader, model, criterion, optimizer)
+    test_loop(test_loader, model, criterion)
+
+fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
+ax1.grid()
+ax2.grid()
+ax1.set_xlabel('Num_epoch')
+ax1.set_ylabel('Accurcacy')
+ax2.set_xlabel('Num_epoch')
+ax2.set_ylabel('Loss')
+ax1.plot(epochs_mas, accuracy_mas, color='r', linewidth=3, label = 'Accuracy')
+ax1.legend()
+ax2.plot(epochs_mas, loss_mas, color='g', linewidth=3, label = 'Loss')
+ax2.legend()
+plt.show()
